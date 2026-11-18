@@ -1170,7 +1170,7 @@ VIEWS.onboard = async (v) => {
   setHeader("欢迎 👋");
   let lv = S.settings.startLevel || 1, goal = S.settings.dailyGoal || 50, reg = S.settings.region || "NZ", nm = S.settings.name || "", ul = S.settings.uiLang || "bi";
   const draw = () => {
-    v.innerHTML = `<div class="title" style="margin:18px 4px 4px;font-size:20px">怎么称呼你？<span class="muted small">（可以不填）</span></div><input id="nm" value="${esc(nm)}" placeholder="比如 Willis" style="margin:8px 0 0">
+    v.innerHTML = `<div class="title" style="margin:18px 4px 4px;font-size:20px">怎么称呼你？<span class="muted small">（可以不填）</span></div><input id="nm" value="${esc(nm)}" placeholder="比如 Alex" style="margin:8px 0 0">
       <div class="title" style="margin:22px 4px 4px;font-size:20px">界面用多少英文？</div><div class="muted" style="margin:0 4px">按钮、标题天天看，顺便就记住了。纠错和讲解一直是中文</div><div class="row" style="flex-wrap:wrap;gap:8px;margin:10px 4px">${[["bi", "中英对照（推荐）"], ["en", "全英文"], ["zh", "中文"]].map(([k, n]) => `<button class="chip ${k === ul ? "on" : ""}" data-u="${k}">${n}</button>`).join("")}</div>
       <div class="title" style="margin:22px 4px 4px;font-size:20px">你在哪个国家生活或准备去？</div><div class="muted" style="margin:0 4px">决定口音、拼写和当地的说法（看病、税号、学校等）</div><div class="row" style="flex-wrap:wrap;gap:8px;margin:10px 4px">${(S.regions || []).map(r => `<button class="chip ${r.key === reg ? "on" : ""}" data-r="${r.key}">${r.flag} ${r.zh}</button>`).join("")}</div>
       <div class="title" style="margin:18px 4px 4px;font-size:20px">你现在的英语水平？</div><div class="muted" style="margin:0 4px">决定课程从哪一级开始，以后随时能改</div>
@@ -2918,8 +2918,8 @@ async function fetchArticle(url) {
   try {
     const r = new Request(url); r.timeoutInterval = 25;
     const html = await r.loadString();
-    const paras = []; const re = /<p[^>]*>([\s\S]*?)<\/p>/g; let m;
-    while ((m = re.exec(html))) { const t = stripTags(m[1]); if (t.length > 60 && !/cookie|subscribe|newsletter|copyright|©|sign up|download the app/i.test(t)) paras.push(t); }
+    const paras = []; const re = /<p(?:\s[^>]*)?>([\s\S]*?)<\/p>/g; let m;   // 不能写成 <p[^>]*>：会把 <path> 也当成段落
+    while ((m = re.exec(html))) { const t = stripTags(m[1]); if (t.length > 60 && t.length < 1500 && !/cookie|subscribe|newsletter|copyright|©|sign up|download the app/i.test(t)) paras.push(t); }
     return paras.join("\n").slice(0, 3500);
   } catch (e) { return ""; }
 }

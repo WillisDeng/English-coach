@@ -45,9 +45,9 @@ def article(url):
     except Exception as e:
         return url, None
     paras, total = [], 0
-    for m in re.finditer(r"<p[^>]*>([\s\S]*?)</p>", page):
+    for m in re.finditer(r"<p(?:\s[^>]*)?>([\s\S]*?)</p>", page):
         t = strip(m.group(1))
-        if len(t) > 60 and not JUNK.search(t):
+        if 60 < len(t) < 1500 and not JUNK.search(t):
             paras.append(t); total += len(t)
             if total > 3600: break
     return url, paras
