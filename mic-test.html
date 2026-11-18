@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Safari 录音测试 v2</title>
+<style>
+:root{--bg:#F2F2EF;--card:#fff;--text:#24262A;--sub:#6A6B6F;--brand:#E6B422;--on:#2E2300;--ok:#27774A;--warn:#935F0B;--line:#E3E3DE}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 -apple-system,"PingFang SC",sans-serif;padding:16px 14px 40px}
+h1{font:800 22px ui-rounded,-apple-system;margin:6px 2px 2px}
+.m{color:var(--sub);font-size:13px}
+.card{background:var(--card);border-radius:18px;padding:14px;margin:12px 0;box-shadow:0 4px 14px rgba(0,0,0,.05)}
+.card b.t{font-size:17px;display:block;margin-bottom:4px}
+button{font:inherit;border:0;border-radius:14px;padding:12px 14px;background:#EAEAE6;color:var(--text)}
+.hold{width:100%;height:76px;margin-top:10px;background:var(--brand);color:var(--on);font:800 19px ui-rounded,-apple-system;box-shadow:inset 0 0 0 1px #C99A12;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+.hold.on{background:#A45026;color:#fff}
+input{width:100%;box-sizing:border-box;font:inherit;padding:11px;border-radius:12px;border:1px solid var(--line);margin-top:8px}
+.meter{height:10px;background:#eee;border-radius:5px;overflow:hidden;margin-top:10px}.meter i{display:block;height:100%;width:0;background:var(--ok)}
+.ok{color:var(--ok);font-weight:700}.bad{color:var(--warn);font-weight:700}
+.out{background:#F6F6F3;border-radius:12px;padding:10px;margin-top:10px;white-space:pre-wrap;font-size:15px;min-height:20px}
+table{width:100%;border-collapse:collapse;font-size:13px}td{border-bottom:1px solid var(--line);padding:5px 2px;vertical-align:top}
+audio{width:100%;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>Safari 录音测试 <span class="m">v2</span></h1>
+<div class="m">测三件事：① 能录到真实声音 ② 录音交给 Gemini 能听出发音问题 ③ 连续录多次都正常。全部做完后截图「结果」发给 Claude。</div>
+
+<div class="card"><b class="t">0. 填 API Key（只存在这台手机的 Safari 里）</b>
+<input id="key" placeholder="AIza..." autocomplete="off">
+<button id="sk" style="margin-top:8px">保存并测试网络</button>
+<div class="out" id="net"></div></div>
+
+<div class="card"><b class="t">1. 按住录音，读这句话</b>
+<div style="font-size:19px;margin-top:6px" id="target">I think the weather will be better on Thursday.</div>
+<div class="m">这句里有 th（think、weather、Thursday）和 v/w，故意读错一两个也行，看 AI 能不能听出来</div>
+<button class="hold" id="hold">按住说话（松开结束）</button>
+<div class="meter"><i id="lv"></i></div>
+<div class="out" id="rec"></div>
+<div id="play"></div></div>
+
+<div class="card"><b class="t">2. AI 听录音点评</b>
+<div class="m">松开后自动发送。第一次大约 3–8 秒</div>
+<div class="out" id="ai"></div></div>
+
+<div class="card"><b class="t">结果</b>
+<table id="tbl"><tr><td>次</td><td>按下→开始收音</td><td>录到</td><td>AI</td></tr></table>
+<div class="m" id="env" style="margin-top:8px"></div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+$("env").textContent = navigator.userAgent.replace(/.*OS ([\d_]+).*/, "iOS $1") + " · 安全环境=" + window.isSecureContext + " · MediaRecorder=" + (typeof MediaRecorder) + " · 主屏幕模式=" + (navigator.standalone ? "是" : "否");
+$("key").value = localStorage.getItem("gk") || "";
+let MODEL = null, CHAIN = null, n = 0, lastBlob = null, lastType = "";
+
+async function api(path, body){
+  const r = await fetch("https://generativelanguage.googleapis.com/v1beta/" + path, { method: body ? "POST" : "GET", headers: { "x-goog-api-key": localStorage.getItem("gk") || "", "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json(); if (j.error) throw new Error(j.error.code + " " + j.error.message); return j;
+}
+// 模型候选：免费额度为 0 的模型（报 429 且 limit: 0）自动跳过，换下一个；成功的那个记住
+async function modelChain(){
+  if (CHAIN) return CHAIN;
+  const j = await api("models?pageSize=200");
+  const names = (j.models || []).filter(m => (m.supportedGenerationMethods || []).includes("generateContent")).map(m => m.name.replace("models/", ""));
+  const ok = x => /^gemini/.test(x) && /flash/.test(x) && !/tts|image|live|embedding|native-audio|computer/.test(x);
+  const rank = x => (/lite/.test(x) ? 2 : 0) + (/preview|exp/.test(x) ? 1 : 0) + (/omni/.test(x) ? 3 : 0);
+  let list = names.filter(ok).sort((a, b) => rank(a) - rank(b) || (a < b ? 1 : -1));
+  const saved = localStorage.getItem("gm");
+  if (saved && list.includes(saved)) list = [saved, ...list.filter(x => x !== saved)];
+  CHAIN = list.length ? list : ["gemini-2.5-flash", "gemini-2.0-flash"];
+  return CHAIN;
+}
+async function pickModel(){ return (await modelChain())[0]; }
+$("sk").onclick = async () => {
+  localStorage.setItem("gk", $("key").value.trim()); CHAIN = null;
+  $("net").textContent = "测试中…";
+  const t = performance.now();
+  try { const c = await modelChain(); $("net").innerHTML = `<span class="ok">✅ 连上 Gemini（${Math.round(performance.now() - t)} 毫秒）</span><br><span class="m">可用模型：${c.slice(0, 5).join("，")}</span>`; }
+  catch (e) { $("net").innerHTML = `<span class="bad">❌ ${e.message}</span>（国内要开代理）`; }
+};
+
+// ---- 录音：麦克风打开一次后一直保持，按下就开始存 ----
+let stream = null, mr = null, chunks = [], tPress = 0, firstMs = null, ctx = null, an = null, raf = 0, peak = 0;
+async function ensureMic(){
+  if (stream && stream.active) return;
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  an = ctx.createAnalyser(); an.fftSize = 1024; ctx.createMediaStreamSource(stream).connect(an);
+}
+function meter(){
+  const d = new Uint8Array(an.fftSize); an.getByteTimeDomainData(d);
+  let pk = 0; for (const x of d) pk = Math.max(pk, Math.abs(x - 128) / 128);
+  peak = Math.max(peak, pk); $("lv").style.width = Math.min(100, pk * 250) + "%";
+  raf = requestAnimationFrame(meter);
+}
+async function press(e){
+  e.preventDefault(); if (mr && mr.state === "recording") return;
+  tPress = performance.now(); firstMs = null; peak = 0; chunks = [];
+  $("hold").classList.add("on"); $("hold").textContent = "🔴 正在录…松开结束"; $("rec").textContent = ""; $("ai").textContent = "";
+  try { await ensureMic(); await ctx.resume(); }
+  catch (err) { $("rec").innerHTML = `<span class="bad">❌ 打不开麦克风：${err.name} ${err.message}</span>`; reset(); return; }
+  const type = MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "audio/webm";
+  mr = new MediaRecorder(stream, { mimeType: type });
+  mr.ondataavailable = ev => { if (ev.data && ev.data.size) { if (firstMs == null) firstMs = Math.round(performance.now() - tPress); chunks.push(ev.data); } };
+  mr.onstart = () => { if (firstMs == null) firstMs = Math.round(performance.now() - tPress); };
+  mr.onstop = done;
+  mr.start(250); meter();
+}
+function release(e){ e.preventDefault(); if (mr && mr.state === "recording") setTimeout(() => mr.stop(), 400); }
+function reset(){ $("hold").classList.remove("on"); $("hold").textContent = "按住说话（松开结束）"; cancelAnimationFrame(raf); $("lv").style.width = "0"; }
+async function done(){
+  reset(); n++;
+  const blob = new Blob(chunks, { type: mr.mimeType }); const secs = ((performance.now() - tPress) / 1000).toFixed(1);
+  const okAudio = blob.size > 2000 && peak > 0.03;
+  $("rec").innerHTML = `${okAudio ? '<span class="ok">✅ 录到声音</span>' : '<span class="bad">❌ 像是静音</span>'} · ${secs} 秒 · ${(blob.size / 1024).toFixed(0)} KB · 音量峰值 ${Math.round(peak * 100)}% · 格式 ${mr.mimeType}`;
+  $("play").innerHTML = `<audio controls src="${URL.createObjectURL(blob)}"></audio>`;
+  const row = document.createElement("tr"); row.innerHTML = `<td>${n}</td><td>${firstMs ?? "?"} 毫秒</td><td>${okAudio ? "✅" : "❌"} ${(blob.size / 1024).toFixed(0)}KB</td><td id="r${n}">…</td>`; $("tbl").appendChild(row);
+  const cell = $("r" + n);
+  if (!localStorage.getItem("gk")) { $("ai").textContent = "先在上面填 API Key"; cell.textContent = "没 Key"; return; }
+  if (!okAudio) { cell.textContent = "跳过"; return; }
+  lastBlob = blob; lastType = mr.mimeType; send(cell);
+}
+async function send(cell){
+  const blob = lastBlob; if (!blob) return;
+  $("ai").textContent = "AI 正在听…"; const t = performance.now();
+  try {
+    const b64 = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result.split(",")[1]); fr.readAsDataURL(blob); });
+    const chain = await modelChain(); let j = null, used = "", errs = [];
+    for (const m of chain.slice(0, 6)) {
+      try { $("ai").textContent = `AI 正在听…（${m}）`; j = await callModel(m, b64); used = m; localStorage.setItem("gm", m); break; }
+      catch (e) { errs.push(m + "：" + e.message.slice(0, 60)); if (!/^(429|404|400|403|500|503)/.test(e.message)) throw e; }
+    }
+    if (!j) throw new Error("所有模型都不可用：\n" + errs.join("\n"));
+    const txt = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("");
+    $("ai").textContent = `（模型 ${used}）\n` + (txt || "（AI 没有返回内容）");
+    if (cell) cell.innerHTML = `<span class="ok">✅ ${((performance.now() - t) / 1000).toFixed(1)}秒</span>`;
+  } catch (err) { $("ai").innerHTML = `<span class="bad">❌ ${esc(err.message)}</span><br><button id="again" style="margin-top:8px">↻ 用刚才的录音再发一次</button>`; $("again").onclick = () => send(null); if (cell) cell.innerHTML = `<span class="bad">❌</span>`; }
+}
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+async function callModel(m, b64){
+    return await api(`models/${m}:generateContent`, {
+      contents: [{ role: "user", parts: [
+        { inline_data: { mime_type: lastType.split(";")[0], data: b64 } },
+        { text: `You are a strict English pronunciation coach for a Chinese adult learner. Target sentence: "${$("target").textContent}". Listen to the audio carefully. Do NOT be lenient and do NOT guess what he meant: judge the actual sounds.\nReply in Simplified Chinese, short:\n1) 你听到的原话（英文，照实写，包括读错的音）\n2) 发音问题：逐个指出读得不对的词和具体的音（比如 th 读成 s、v 读成 w、词尾辅音丢了），没有就说没有\n3) 重音和连读\n4) 一句最重要的改进建议\n5) 总分 0-100` } ] }],
+      generationConfig: { temperature: 0.2 }
+    });
+}
+const h = $("hold");
+h.addEventListener("touchstart", press, { passive: false }); h.addEventListener("touchend", release, { passive: false });
+h.addEventListener("mousedown", press); h.addEventListener("mouseup", release);
+</script>
+</body>
+</html>
