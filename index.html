@@ -1870,7 +1870,7 @@ VIEWS.settings = async (v, p) => {
     <div class="muted small" style="margin-top:14px">界面英文程度（纠错、讲解一直是中文）</div><div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">${[["bi", "中英对照"], ["en", "全英文"], ["zh", "中文"]].map(([k, n]) => `<button class="chip ${k === (st.uiLang || "bi") ? "on" : ""}" data-ul="${k}">${n}</button>`).join("")}</div>
     <div class="muted small" style="margin-top:14px">配色</div><div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">${[["dui", "兑白 · 坤黄"], ["harbour", "港湾蓝"]].map(([k, n]) => `<button class="chip ${k === (st.palette || "dui") ? "on" : ""}" data-pal="${k}">${n}</button>`).join("")}</div>
     <div class="muted small" style="margin-top:14px">颜色模式（研究发现浅底深字读得更准，所以默认浅色）</div><div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">${[["light", "浅色（推荐）"], ["auto", "跟随手机"], ["dark", "深色"]].map(([k, n]) => `<button class="chip ${k === (st.theme || "light") ? "on" : ""}" data-th="${k}">${n}</button>`).join("")}</div></div>`;
-  h += `<h2>Gemini API Key</h2><div class="card"><div class="muted small">${S.hasKey ? "✅ 已设置。要更换就在下面重新粘贴。" : `在 aistudio.google.com 免费申请（需要代理），以 AIza 开头。${window.__WEB ? "只存在这台手机的浏览器里，不会上传到任何地方。" : "只存在本机钥匙串。"}`}</div><div class="typebox"><input id="key" placeholder="AIza..." autocomplete="off"><button class="btn" id="sk">保存</button></div></div>`;
+  h += `<h2>Gemini API Key</h2><div class="card"><div class="muted small">${S.hasKey ? "✅ 已设置。要更换就在下面重新粘贴。" : `在 aistudio.google.com 免费申请（需要代理），点 Key 旁的「复制」再粘贴到这里。${window.__WEB ? "只存在这台手机的浏览器里，不会上传到任何地方。" : "只存在本机钥匙串。"}`}</div><div class="typebox"><input id="key" placeholder="粘贴 API Key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"><button class="btn" id="sk">保存</button></div></div>`;
   h += `<h2>朗读声音</h2><div class="card">
     <div class="title" style="font-size:16px">长内容（新闻、课程对话）</div>
     <div class="row" style="margin-top:8px"><span class="muted small grow">默认用系统声音。打开后改用 AI 真人语音（Gemini，第一次生成要等一会儿）</span><div class="seg" id="ail"><button data-a="on">开</button><button data-a="off">关</button></div></div>
@@ -1914,7 +1914,7 @@ VIEWS.settings = async (v, p) => {
   $$("[data-ul]", v).forEach(b => b.onclick = async () => { S.settings = await rpc("saveSettings", { uiLang: b.dataset.ul }); render(); });
   $$("[data-pal]", v).forEach(b => b.onclick = async () => { S.settings = await rpc("saveSettings", { palette: b.dataset.pal }); render(); });
   $$("[data-th]", v).forEach(b => b.onclick = async () => { S.settings = await rpc("saveSettings", { theme: b.dataset.th }); render(); });
-  $("#sk", v).onclick = async () => { try { await rpc("setKey", { key: $("#key", v).value }); await refresh(); toast("已保存 ✓"); stack.length = 0; tab("home"); } catch(e){ toast(e.message, 3000); } };
+  $("#sk", v).onclick = async () => { overlay(`<div class="spin"></div><div class="title">正在检查 Key…</div>`); try { const r = await rpc("setKey", { key: $("#key", v).value }); closeOverlay(); await refresh(); toast(r && r.verified ? "Key 可以用 ✓ 已保存" : "已保存（没连上 Google 检查，请确认代理已打开）", 3000); stack.length = 0; tab("home"); } catch(e){ closeOverlay(); toast(e.message, 5000); } };
   $("#acc", v).onchange = async e => { S.settings = await rpc("saveSettings", { accent: e.target.value }); TTS.speak("Kia ora! Let's practise some English."); };
   $("#aiv", v).onchange = async e => { S.settings = await rpc("saveSettings", { aiVoice: e.target.value }); };
   $$("#ail button", v).forEach(b => { b.classList.toggle("on", (b.dataset.a === "on") === (st.aiLong === true)); b.onclick = async () => { S.settings = await rpc("saveSettings", { aiLong: b.dataset.a === "on" }); render(); }; });
@@ -2347,6 +2347,25 @@ function getKey() {
   return k;
 }
 const versionOf = n => { const m = n.match(/gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
+
+// 保存 Key：不再只认 AIza 开头（Google 新发的 Key 格式可能不同）。从粘贴的内容里挑出 Key，再问 Google 这个 Key 能不能用
+async function setKey({ key }) {
+  const raw = String(key || "").replace(/[\u200B-\u200D\uFEFF\u00A0]/g, " ").trim();
+  const m = raw.match(/AIza[0-9A-Za-z_\-]{20,}/) || raw.match(/[0-9A-Za-z_\-\.]{30,}/);
+  if (!m) throw new Error(raw ? "没认出 Key：请在 AI Studio 点 Key 旁边的「复制」再粘贴（长度一般 39 位）" : "还没粘贴 Key");
+  key = m[0];
+  const r = new Request(`${API}/models?pageSize=1`);
+  r.headers = { "x-goog-api-key": key }; r.timeoutInterval = 15;
+  let j = null;
+  try { j = await r.loadJSON(); } catch (e) { j = null; }
+  if (j && j.error) {
+    const msg = String(j.error.message || "");
+    if (/key|permission|denied|unauthenticated/i.test(msg) || [400, 401, 403].includes(j.error.code)) throw new Error("Google 说这个 Key 不能用：" + msg.slice(0, 120));
+  }
+  Keychain.set("gemini_api_key", key);
+  if (Keychain.contains("gemini_model")) Keychain.remove("gemini_model");
+  return { verified: !!(j && j.models), len: key.length };
+}
 
 async function pickModels(key) {
   const cached = Keychain.contains("gemini_model") ? JSON.parse(Keychain.get("gemini_model")) : null;
@@ -3051,7 +3070,7 @@ const RPC = {
   state: async () => { stage("页面请求数据"); const r = await stateFor(); GOT_STATE = true; stage("数据已返回页面"); return r; },
   bootError: ({ msg }) => { stage("页面报错：" + msg); return true; },
   pstage: ({ s }) => { stage("页面：" + s); if (/首页已显示|画面第一次刷新/.test(s)) PAINTED = true; return true; },
-  setKey: ({ key }) => { key = (key || "").trim(); if (!/^AIza/.test(key)) throw new Error("看起来不是 Gemini API Key（应以 AIza 开头）"); Keychain.set("gemini_api_key", key); if (Keychain.contains("gemini_model")) Keychain.remove("gemini_model"); return true; },
+  setKey: (p) => setKey(p),
   saveSettings: (s) => { Object.assign(settings, s || {}); saveSettings(); return settings; },
   grade: ({ id, q }) => grade(id, q),
   addCards: ({ items, cat }) => addCards(items, cat),
