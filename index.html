@@ -1871,6 +1871,7 @@ VIEWS.settings = async (v, p) => {
     <div class="muted small" style="margin-top:14px">配色</div><div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">${[["dui", "兑白 · 坤黄"], ["harbour", "港湾蓝"]].map(([k, n]) => `<button class="chip ${k === (st.palette || "dui") ? "on" : ""}" data-pal="${k}">${n}</button>`).join("")}</div>
     <div class="muted small" style="margin-top:14px">颜色模式（研究发现浅底深字读得更准，所以默认浅色）</div><div class="row" style="flex-wrap:wrap;gap:8px;margin-top:8px">${[["light", "浅色（推荐）"], ["auto", "跟随手机"], ["dark", "深色"]].map(([k, n]) => `<button class="chip ${k === (st.theme || "light") ? "on" : ""}" data-th="${k}">${n}</button>`).join("")}</div></div>`;
   h += `<h2>Gemini API Key</h2><div class="card"><div class="muted small">${S.hasKey ? "✅ 已设置。要更换就在下面重新粘贴。" : `在 aistudio.google.com 免费申请（需要代理），点 Key 旁的「复制」再粘贴到这里。${window.__WEB ? "只存在这台手机的浏览器里，不会上传到任何地方。" : "只存在本机钥匙串。"}`}</div><div class="typebox"><input id="key" placeholder="粘贴 API Key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"><button class="btn" id="sk">保存</button></div></div>`;
+  h += `<div class="muted small" id="aist" style="margin:-4px 6px 8px"></div>`;
   h += `<h2>朗读声音</h2><div class="card">
     <div class="title" style="font-size:16px">长内容（新闻、课程对话）</div>
     <div class="row" style="margin-top:8px"><span class="muted small grow">默认用系统声音。打开后改用 AI 真人语音（Gemini，第一次生成要等一会儿）</span><div class="seg" id="ail"><button data-a="on">开</button><button data-a="off">关</button></div></div>
@@ -1910,6 +1911,7 @@ VIEWS.settings = async (v, p) => {
   h += `<details class="card small"><summary>启动用时（慢的话截图给 Claude）</summary><div class="muted" style="margin-top:8px;white-space:pre-line">${esc((S.diag || []).join("\n"))}\n页面显示：${((window.__shownAt || 0) / 1000).toFixed(1)}s（从页面加载算起）</div></details>`;
   v.innerHTML = h;
   $("#snm", v).onclick = async () => { S.settings = await rpc("saveSettings", { name: $("#nmx", v).value.trim() }); toast("已保存 ✓"); };
+  rpc("aiStats").then(all => { const a = (all || []).filter(x => x.ok), el = $("#aist", v); if (!el || !a.length) return; const avg = Math.round(a.reduce((t, x) => t + x.ms, 0) / a.length / 100) / 10; const slow = a.filter(x => x.ms > 40000).length; el.textContent = `AI 最近 ${a.length} 次平均 ${avg} 秒${slow ? `，其中 ${slow} 次超过 40 秒` : ""} · 模型 ${a[a.length - 1].m}`; }).catch(() => {});
   $("#sab", v).onclick = async () => { S.settings = await rpc("saveSettings", { about: $("#abt", v).value.trim().slice(0, 300) }); toast("已保存 ✓"); };
   $$("[data-ul]", v).forEach(b => b.onclick = async () => { S.settings = await rpc("saveSettings", { uiLang: b.dataset.ul }); render(); });
   $$("[data-pal]", v).forEach(b => b.onclick = async () => { S.settings = await rpc("saveSettings", { palette: b.dataset.pal }); render(); });
@@ -2395,41 +2397,69 @@ async function pickModels(key) {
 }
 const wait = ms => new Promise(res => Timer.schedule(ms, false, res));
 
+// 速度：新版 flash 默认会先"思考"再回答，慢好几倍；这里关掉/调到最低（模型不接受就自动去掉，并记住）
+function thinkingFor(model) {
+  if (kcJSON("gemini_nothink", {})[model]) return null;
+  const v = versionOf(model);
+  if (v >= 3) return { thinkingLevel: /lite/.test(model) ? "minimal" : "minimal" };
+  if (v >= 2.5) return { thinkingBudget: 0 };
+  return null;
+}
+function kcJSON(k, d) { try { return Keychain.contains(k) ? JSON.parse(Keychain.get(k)) : d; } catch (e) { return d; } }
+function kcSet(k, v) { try { Keychain.set(k, JSON.stringify(v)); } catch (e) {} }
+// 免费额度为 0 的模型（429 limit: 0）：一天内直接跳过，不再等
+function skipped(model) { const m = kcJSON("gemini_skip", {}); return m[model] && m[model] > Date.now(); }
+function skipModel(model) { const m = kcJSON("gemini_skip", {}); m[model] = Date.now() + DAY; kcSet("gemini_skip", m); }
+// 最近 20 次 AI 调用：用的模型、用时、换了几次模型 —— 设置页显示，慢的时候有数据可查
+function logCall(model, ms, hops, ok) {
+  const a = kcJSON("gemini_stats", []); a.push({ m: model, ms, h: hops, ok: ok ? 1 : 0, t: Date.now() });
+  kcSet("gemini_stats", a.slice(-20));
+}
+
 async function gemini(system, userText, schema, temperature = 0.7, contents, opts) {
   const key = getKey();
   const models = await pickModels(key);
   const last = Keychain.contains("gemini_last_ok") ? Keychain.get("gemini_last_ok") : "";
   let chain = last && models.chain.includes(last) ? [last, ...models.chain.filter(m => m !== last)] : models.chain;
   if (opts && opts.lite) chain = chain.filter(m => /lite/.test(m)).concat(chain.filter(m => !/lite/.test(m)));
-  const body = JSON.stringify({
+  const live = chain.filter(m => !skipped(m)); if (live.length) chain = live;
+  const base = {
     systemInstruction: { parts: [{ text: system }] },
     contents: contents || [{ role: "user", parts: [{ text: userText }] }],
-    generationConfig: { temperature, responseMimeType: "application/json", responseSchema: schema },
-  });
-  let lastErr = "", busy = 0;
+  };
+  const t0 = Date.now();
+  let lastErr = "", busy = 0, hops = 0;
   for (const model of chain) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    hops++;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const gc = { temperature, responseMimeType: "application/json", responseSchema: schema };
+      const th = thinkingFor(model); if (th) gc.thinkingConfig = th;
       const r = new Request(`${API}/models/${model}:generateContent`);
-      r.method = "POST"; r.timeoutInterval = 90; r.body = body;
+      r.method = "POST"; r.timeoutInterval = 90; r.body = JSON.stringify(Object.assign({ generationConfig: gc }, base));
       r.headers = { "Content-Type": "application/json", "x-goog-api-key": key };
       let j;
       try { j = await r.loadJSON(); } catch (e) { lastErr = "网络错误（国内需要开代理）"; break; }
       if (j && j.error) {
         const code = j.error.code || (r.response && r.response.statusCode);
-        lastErr = `${code} ${j.error.message || ""}`;
+        const msg = String(j.error.message || "");
+        lastErr = `${code} ${msg}`;
+        if (code === 400 && th && /think/i.test(msg)) { const m = kcJSON("gemini_nothink", {}); m[model] = 1; kcSet("gemini_nothink", m); continue; }
+        if (code === 429 && /limit:\s*0\b/.test(msg)) { skipModel(model); break; }   // 这个模型免费版用不了：直接换下一个
         if ([429, 500, 503].includes(code)) { busy++; if (attempt === 0) { await wait(code === 429 ? 4000 : 2500); continue; } break; }
         if (code === 404) { if (Keychain.contains("gemini_model")) Keychain.remove("gemini_model"); break; }
-        if ([400, 401, 403].includes(code) && /key/i.test(j.error.message || "")) throw new Error("BAD_KEY");
+        if ([400, 401, 403].includes(code) && /key/i.test(msg)) throw new Error("BAD_KEY");
+        logCall(model, Date.now() - t0, hops, false);
         throw new Error(lastErr);
       }
       const text = j && j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts
-        ? j.candidates[0].content.parts.map(p => p.text || "").join("") : "";
+        ? j.candidates[0].content.parts.filter(p => !p.thought).map(p => p.text || "").join("") : "";
       let out = null;
       try { out = JSON.parse(text); } catch (e) { const m = text.match(/\{[\s\S]*\}/); if (m) { try { out = JSON.parse(m[0]); } catch (e2) {} } }
-      if (out) { Keychain.set("gemini_last_ok", model); return out; }
+      if (out) { if (!(opts && opts.lite)) Keychain.set("gemini_last_ok", model); logCall(model, Date.now() - t0, hops, true); return out; }
       lastErr = "模型返回格式异常"; break;
     }
   }
+  logCall(chain[chain.length - 1] || "", Date.now() - t0, hops, false);
   if (busy) throw new Error(`Google 的模型现在太忙，已自动重试并换了 ${chain.length} 个模型。等 1–2 分钟再试，一般就好了。`);
   throw new Error(lastErr || "调用失败");
 }
@@ -2977,7 +3007,7 @@ async function getNews({ cat, force }) {
   try {
     const pick = await gemini(
       "Pick the ONE news item that is most engaging and talk-worthy for an adult English learner: interesting, surprising, useful or fun to discuss. Avoid deaths, violent crime, abuse and tragedies. Return its 0-based index.",
-      items.map((x, k) => `${k}. ${x.title} — ${x.desc}`).join("\n"), S.obj({ index: S.int }), 0.3);
+      items.map((x, k) => `${k}. ${x.title} — ${x.desc}`).join("\n"), S.obj({ index: S.int }), 0.3, null, { lite: true });
     idx = Math.max(0, Math.min(items.length - 1, pick.index | 0));
   } catch (e) { idx = Math.max(0, items.findIndex(x => !bad.test(x.title))); }
   const it = items[idx];
@@ -3062,6 +3092,7 @@ async function stateFor() {
     resume: latestResume(),
     diag: DIAG.slice(),
     store: { kind: STORE, path: DIR, bookmark: BOOKMARK, web: IS_WEB },
+    aiStats: kcJSON("gemini_stats", []),
   };
 }
 
@@ -3121,6 +3152,7 @@ const RPC = {
   audioPart: (p) => audioPart(p),
   exportAudio: (p) => exportAudio(p),
   exportAll: () => exportAll(),
+  aiStats: () => kcJSON("gemini_stats", []),
   importAll: (p) => importAll(p),
   turn: (p) => coachTurn(p),
   hint: (p) => coachHint(p),

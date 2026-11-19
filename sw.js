@@ -1,5 +1,5 @@
 // 离线缓存：网页本身先联网取最新（4 秒取不到就用缓存）；Google AI 的请求不经过这里
-const V = "ec-d0711944e5";
+const V = "ec-cf83db53c0";
 const SHELL = ["./", "index.html", "manifest.webmanifest", "icon-180.png", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
 self.addEventListener("activate", e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== V).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
