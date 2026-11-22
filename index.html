@@ -492,11 +492,14 @@ nav.tabs .zh1{font-size:10px;margin:0}
 .opt.right{border-color:var(--ok);background:var(--ok-soft)}
 .opt.wrongo{border-color:var(--bad);background:var(--bad-soft)}
 .qz{min-height:360px}
-.slots{min-height:56px;border-bottom:2px solid var(--line);padding:6px 0 10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-.tiles{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
-.tile2{background:var(--card);border:2px solid var(--line);border-bottom-width:4px;border-radius:12px;padding:8px 12px;font-size:17px}
+.slots{position:relative;min-height:76px;border-bottom:2px solid var(--line);padding:8px 0 12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.tiles{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+.tile2{background:var(--card);border:2px solid var(--line);border-bottom-width:4px;border-radius:14px;padding:11px 16px;min-height:52px;min-width:48px;font-size:20px;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
 .tile2.used{visibility:hidden}
 .tile2.in{border-color:var(--brand)}
+.tile2.ghost{opacity:.25}
+.tile2.fly{position:fixed;z-index:50;pointer-events:none;margin:0;box-shadow:0 10px 24px rgba(0,0,0,.22);transform:scale(1.08);border-color:var(--brand)}
+.caret{position:absolute;width:4px;border-radius:2px;background:var(--brand);pointer-events:none}
 .sheet{position:fixed;left:0;right:0;bottom:0;z-index:45;padding:18px 18px calc(18px + env(safe-area-inset-bottom));border-radius:20px 20px 0 0;box-shadow:0 -6px 24px rgba(0,0,0,.15)}
 .sheet.good{background:var(--ok-soft);color:var(--ok)} .sheet.bad{background:var(--bad-soft);color:var(--bad)}
 .sheet .btn{background:currentColor} .sheet .btn{color:#fff} .sheet.good .btn{background:var(--ok)} .sheet.bad .btn{background:var(--bad)}
@@ -1339,11 +1342,60 @@ function Quiz(box, items, onDone, saved, onProgress){
     if (it.type === "build") {
       const picked = [];
       const redraw = () => {
-        $("#slots", box).innerHTML = picked.map((i, k) => `<button class="tile2 in" data-k="${k}">${esc(it.tiles[i])}</button>`).join("") || `<span class="muted small">点下面的词</span>`;
+        $("#slots", box).innerHTML = picked.map((i, k) => `<button class="tile2 in" data-k="${k}">${esc(it.tiles[i])}</button>`).join("") || `<span class="muted small">点下面的词；按住拖动可以换位置、插到中间</span>`;
         $$("#tiles .tile2", box).forEach(b => b.classList.toggle("used", picked.includes(+b.dataset.t)));
-        $$("#slots .tile2", box).forEach(b => b.onclick = () => { picked.splice(+b.dataset.k, 1); redraw(); });
+        $$("#slots .tile2", box).forEach(b => dragTile(b, () => { picked.splice(+b.dataset.k, 1); redraw(); }, +b.dataset.k, picked[+b.dataset.k]));
       };
-      $$("#tiles .tile2", box).forEach(b => b.onclick = () => { const i = +b.dataset.t; if (!picked.includes(i)) { picked.push(i); TTS.speak(it.tiles[i]); redraw(); } });
+      // 点一下：下面的词加到末尾 / 上面的词删掉；按住拖动：插到任意位置、上面的词换位置，拖回下面就是删掉
+      const slotsEl = $("#slots", box);
+      const dropIndex = (x, y, skip) => {
+        const ts = $$("#slots .tile2", box).filter(t => t !== skip);
+        for (let k = 0; k < ts.length; k++) {
+          const r = ts[k].getBoundingClientRect();
+          if (y < r.top - 5 || (y <= r.bottom + 5 && x < r.left + r.width / 2)) return { at: k, el: ts[k], before: true };
+        }
+        return { at: ts.length, el: ts[ts.length - 1], before: false };
+      };
+      const overSlots = y => { const r = slotsEl.getBoundingClientRect(); return y < r.bottom + 24; };
+      function dragTile(b, onTap, fromK, tileIdx) {
+        b.onpointerdown = e => {
+          if (e.button > 0) return;
+          const sx = e.clientX, sy = e.clientY, r0 = b.getBoundingClientRect();
+          let fly = null, caret = null, drop = null;
+          b.setPointerCapture && b.setPointerCapture(e.pointerId);
+          const move = ev => {
+            if (!fly) {
+              if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 8) return;
+              fly = b.cloneNode(true); fly.classList.add("fly"); fly.style.width = r0.width + "px"; document.body.appendChild(fly);
+              b.classList.add("ghost");
+              caret = document.createElement("i"); caret.className = "caret"; slotsEl.appendChild(caret);
+            }
+            ev.preventDefault();
+            fly.style.left = (ev.clientX - (sx - r0.left)) + "px"; fly.style.top = (ev.clientY - (sy - r0.top)) + "px";
+            if (overSlots(ev.clientY)) {
+              drop = dropIndex(ev.clientX, ev.clientY, fromK != null ? b : null);
+              const sr = slotsEl.getBoundingClientRect();
+              if (drop.el) { const r = drop.el.getBoundingClientRect(); caret.style.left = (drop.before ? r.left - 7 : r.right + 3) - sr.left + "px"; caret.style.top = r.top - sr.top + "px"; caret.style.height = r.height + "px"; }
+              else { caret.style.left = "2px"; caret.style.top = "14px"; caret.style.height = "48px"; }
+              caret.style.display = "block";
+            } else { drop = null; caret.style.display = "none"; }
+          };
+          const up = () => {
+            b.removeEventListener("pointermove", move); b.removeEventListener("pointerup", up); b.removeEventListener("pointercancel", cancel);
+            if (!fly) { onTap(); return; }
+            fly.remove(); caret.remove(); b.classList.remove("ghost");
+            if (fromK != null) {                       // 上面的词：换位置，拖出去就删掉
+              picked.splice(fromK, 1);
+              if (drop) picked.splice(drop.at, 0, tileIdx);
+            } else if (drop && !picked.includes(tileIdx)) { picked.splice(drop.at, 0, tileIdx); TTS.speak(it.tiles[tileIdx]); }
+            redraw();
+          };
+          const cancel = () => { b.removeEventListener("pointermove", move); b.removeEventListener("pointerup", up); b.removeEventListener("pointercancel", cancel); if (fly) { fly.remove(); caret.remove(); b.classList.remove("ghost"); } };
+          b.addEventListener("pointermove", move); b.addEventListener("pointerup", up); b.addEventListener("pointercancel", cancel);
+        };
+        b.onclick = null;
+      }
+      $$("#tiles .tile2", box).forEach(b => { const i = +b.dataset.t; dragTile(b, () => { if (!picked.includes(i)) { picked.push(i); TTS.speak(it.tiles[i]); redraw(); } }, null, i); });
       $("#clr", box).onclick = () => { picked.length = 0; redraw(); };
       $("#chk", box).onclick = () => { const said = picked.map(i => it.tiles[i]).join(" "); result(words(said).join(" ") === words(it.en).join(" "), it.en); };
       redraw();
