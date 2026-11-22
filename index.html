@@ -479,6 +479,9 @@ nav.tabs .zh1{font-size:10px;margin:0}
 .reader textarea{font-size:17px;min-height:84px}
 .out2{min-height:52px;background:var(--bg);border-radius:12px;padding:10px 12px;font-size:18px;margin-top:6px}
 .mic.rec{background:var(--bad)}
+.mic:disabled{opacity:.55}
+.lvl{height:6px;border-radius:9px;background:var(--chip);overflow:hidden;margin-top:10px}
+.lvl>i{display:block;height:100%;width:0;background:var(--ok);transition:width .08s linear}
 .live{opacity:.65}
 .tapme{position:relative}
 .tapme .tip{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:8px;border-radius:12px;background:var(--brand);color:var(--on-brand);font-size:18px;font-weight:700;animation:tapPulse 1.4s infinite}
@@ -675,7 +678,7 @@ function keyInput(o){
 // Safari 版（5.0）：没有苹果听写面板，只有「按住说」（网页识别）和「键盘听写」；旧设置里的 auto / native 一律当成按住说
 function sttMode(){
   const m = (S.settings && S.settings.stt) || "auto";
-  if (window.__WEB) return (m === "keyboard" || !(window.SpeechRecognition || window.webkitSpeechRecognition)) ? "keyboard" : "hold";
+  if (window.__WEB) return (m !== "keyboard" && AIREC.supported()) ? "ai" : "keyboard";
   return m;
 }
 // ---- 按住说话：网页语音识别（需要 https 环境；不可用时退回键盘听写 / 系统听写） ----
@@ -784,6 +787,119 @@ function holdToTalk(btn, { onText, onDone, idle }){
   btn.addEventListener("mousedown", press); btn.addEventListener("mouseup", release);
   label(idle);
 }
+// ---- 5.1：真录音 + AI 听（不用苹果听写：没有"只能录一次"，也没有提示音） ----
+// 麦克风打开一次后保持，按下就开始录；离开 60 秒或 App 切到后台就关掉麦克风
+const AIREC = {
+  stream: null, ctx: null, an: null, idleT: 0,
+  supported(){ return !!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia); },
+  ok(){ return sttMode() === "ai"; },
+  async mic(){
+    clearTimeout(this.idleT);
+    if (this.stream && this.stream.active && this.stream.getAudioTracks().some(t => t.readyState === "live")) return this.stream;
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    try { this.ctx = this.ctx || new (window.AudioContext || window.webkitAudioContext)(); this.an = this.ctx.createAnalyser(); this.an.fftSize = 1024; this.ctx.createMediaStreamSource(this.stream).connect(this.an); } catch (e) { this.an = null; }
+    return this.stream;
+  },
+  idle(){ clearTimeout(this.idleT); this.idleT = setTimeout(() => this.release(), 60000); },
+  release(){ clearTimeout(this.idleT); if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; } },
+  level(){ if (!this.an) return 0; const d = new Uint8Array(this.an.fftSize); this.an.getByteTimeDomainData(d); let pk = 0; for (const x of d) pk = Math.max(pk, Math.abs(x - 128) / 128); return pk; },
+};
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") AIREC.release(); });
+const blobB64 = blob => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1] || ""); r.onerror = () => rej(r.error); r.readAsDataURL(blob); });
+// 按钮：按住录、松开结束；或点一下开始、再点一下结束。最长 30 秒
+function recToTalk(btn, { idle, onDone, onLevel }){
+  let mr = null, chunks = [], t0 = 0, down = 0, toggle = false, peak = 0, raf = 0, tick = 0, busy = false;
+  const label = t => { btn.innerHTML = t; };
+  const stopUI = () => { cancelAnimationFrame(raf); clearInterval(tick); btn.classList.remove("rec"); label(idle); onLevel && onLevel(0); };
+  const loop = () => { const l = AIREC.level(); peak = Math.max(peak, l); onLevel && onLevel(l); raf = requestAnimationFrame(loop); };
+  const begin = async () => {
+    busy = true; chunks = []; peak = 0; t0 = Date.now();
+    btn.classList.add("rec"); label("🔴 正在录…");
+    let stream;
+    try { stream = await AIREC.mic(); if (AIREC.ctx && AIREC.ctx.state !== "running") await AIREC.ctx.resume(); }
+    catch (e) { busy = false; stopUI(); onDone({ err: /NotAllowed|Permission/i.test(e.name + e.message) ? "not-allowed" : (e.name || "mic") }); return; }
+    const type = MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : (MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "");
+    mr = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    mr.ondataavailable = ev => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    mr.onstop = () => {
+      const secs = (Date.now() - t0) / 1000, blob = new Blob(chunks, { type: (mr && mr.mimeType) || type || "audio/mp4" });
+      mr = null; busy = false; stopUI(); AIREC.idle();
+      if (secs < 0.6 || blob.size < 1500) { onDone({ err: "short" }); return; }
+      if (AIREC.an && peak < 0.02) { onDone({ err: "silent" }); return; }
+      onDone({ blob, secs });
+    };
+    mr.start(250); loop();
+    const upd = () => { const s = Math.floor((Date.now() - t0) / 1000); label(`🔴 ${toggle ? "正在录… 说完点一下结束" : "正在录… 松开结束"} 0:${String(s).padStart(2, "0")}`); if (s >= 30) finish(); };
+    upd(); tick = setInterval(upd, 500);
+  };
+  const finish = () => { if (mr && mr.state === "recording") { const m = mr; setTimeout(() => { try { m.state === "recording" && m.stop(); } catch (e) {} }, 350); } };
+  const press = e => { e.preventDefault(); if (mr) { finish(); return; } if (busy || btn.disabled) return; down = Date.now(); toggle = false; begin(); };
+  const release = e => { e.preventDefault(); if (!mr && !busy) return; if (Date.now() - down < 400) { toggle = true; return; } if (!toggle) finish(); };
+  btn.addEventListener("touchstart", press, { passive: false }); btn.addEventListener("touchend", release, { passive: false }); btn.addEventListener("touchcancel", release, { passive: false });
+  btn.addEventListener("mousedown", press); btn.addEventListener("mouseup", release);
+  label(idle);
+}
+const RECERR = { "not-allowed": "麦克风没被允许：请在弹窗里选「允许」；以前拒绝过的话，到 iPhone 设置 › Safari › 麦克风 改成允许", short: "太短了：按住说完整句再松开", silent: "没录到声音：靠近一点再说" };
+let LAST_HEAR = null;   // 最近一次 AI 听的结果（跟读打分用）
+// 看着读 / 回答：上方原文，下方按住录音；松开后交给 AI 听
+function aiPanel(o){
+  return new Promise(res => {
+    const old = $("#reader"); if (old) old.remove(); closePop();
+    const d = document.createElement("div"); d.className = "reader"; d.id = "reader";
+    d.innerHTML = `${o.ctx ? `<div class="muted small">${esc(o.ctxLabel || "对方说：")}</div><div class="en" style="font-size:17px;margin-bottom:10px">${esc(o.ctx)}</div>` : ""}${o.target && !o.hide ? `<div class="muted small">看着读：<span style="opacity:.8">（不会读的词点一下）</span></div><div class="rtarget">${wordify(esc(o.target))}</div><div class="card" id="rgloss" hidden style="padding:8px 10px;margin:-4px 0 10px"></div>` : ""}${o.hide ? `<div class="muted">🔴 高级模式：凭记忆复述刚才听到的句子</div>` : ""}<div class="out2" id="live"><span class="muted small">${o.target ? "按住说，松开后 AI 帮你听发音" : "按住说，松开后 AI 转成文字"}</span></div><div class="lvl"><i id="lvl"></i></div><button class="mic" id="hold" style="margin-top:10px"></button><div class="btns"><button class="btn plain" data-c>取消</button>${o.target ? `<button class="btn ghost" data-s>🔊 听</button>` : ""}</div>`;
+    document.body.appendChild(d);
+    const live = $("#live", d), lvl = $("#lvl", d), mic = $("#hold", d);
+    let done = false;
+    const fin = v => { if (done) return; done = true; d.remove(); res(v); };
+    $("[data-c]", d).onclick = () => fin(null);
+    const sb = $("[data-s]", d); if (sb) sb.onclick = () => TTS.speak(o.target);
+    const ask = async (blob, mime) => {
+      mic.disabled = true;
+      live.innerHTML = `<span class="muted">🤖 AI 正在听…</span>`;
+      try {
+        const b64 = await blobB64(blob);
+        const r = await rpc("hear", { b64, mime, target: o.target || null });
+        if (done) return;
+        const t = (r.heard || "").trim();
+        if (!t) { live.innerHTML = `<span class="muted small">AI 没听清，再说一次</span>`; return; }
+        if (/[\u4e00-\u9fff]/.test(t)) { live.innerHTML = `${esc(t)}<div class="small" style="color:var(--bad)">听到的是中文，请用英文再说一次</div>`; return; }
+        LAST_HEAR = Object.assign({ target: o.target || null, url: URL.createObjectURL(blob) }, r, { heard: t });
+        live.textContent = t;
+        fin(t);
+      } catch (e) {
+        if (done) return;
+        live.innerHTML = `<span class="small" style="color:var(--bad)">${esc(e.message || "AI 没回应")}</span><div class="btns" style="margin-top:6px"><button class="btn ghost" id="again">↻ 用刚才的录音再发一次</button></div>`;
+        $("#again", d).onclick = () => ask(blob, mime);
+      } finally { mic.disabled = false; }
+    };
+    recToTalk(mic, {
+      idle: "🎤 按住说话（或点一下开始）",
+      onLevel: l => { lvl.style.width = Math.min(100, l * 260) + "%"; },
+      onDone: r => { if (r.err) { live.innerHTML = `<span class="muted small">${esc(RECERR[r.err] || ("录音出错：" + r.err))}</span>`; return; } ask(r.blob, r.blob.type); },
+    });
+  });
+}
+// 跟读打分：有 AI 听的结果就用 AI 的（发音 + 漏词），否则按文字比对
+function judge(target, said){
+  const w = shadowScore(target, said);
+  const h = LAST_HEAR;
+  if (!h || h.target !== target || h.heard !== said || typeof h.score !== "number") return w;
+  const m = new Set(w.missed); (h.issues || []).forEach(x => words(x.word).forEach(y => m.add(y)));
+  return { score: Math.min(h.score, w.score), missed: Array.from(m), ai: h };
+}
+// AI 的具体问题（弹窗里显示）+ 听自己的录音
+function hearHtml(r){
+  if (!r || !r.ai) return "";
+  const h = r.ai;
+  return `${(h.issues || []).length ? `<div style="margin-top:8px;text-align:left">${h.issues.map(x => `<div style="margin:6px 0"><b>${esc(x.word)}</b>${x.heard_as ? ` <span class="muted small">听起来像「${esc(x.heard_as)}」</span>` : ""}<div class="small">${esc(x.tip_zh || "")}</div></div>`).join("")}</div>` : ""}${h.overall_zh ? `<div class="muted small" style="margin-top:6px">${esc(h.overall_zh)}</div>` : ""}<div class="btns" style="margin-top:10px"><button class="btn ghost" data-myrec>▶ 听我自己的</button><button class="btn ghost" data-orig="${esc(h.target || "")}">🔊 原声</button></div>`;
+}
+let MYREC_AUDIO = null;
+document.addEventListener("click", e => {
+  const a = e.target.closest && e.target.closest("[data-myrec]");
+  if (a && LAST_HEAR && LAST_HEAR.url) { TTS.stop(); try { if (MYREC_AUDIO) MYREC_AUDIO.pause(); MYREC_AUDIO = new Audio(LAST_HEAR.url); MYREC_AUDIO.play(); } catch (err) {} return; }
+  const b = e.target.closest && e.target.closest("[data-orig]");
+  if (b && b.dataset.orig) TTS.speak(b.dataset.orig);
+});
 const ERRTXT = { "no-speech": "没听到声音", "audio-capture": "麦克风被占用", "not-allowed": "麦克风没被允许", "network": "网络问题", "aborted": "被中断" };
 // 看着读 / 回答：上方显示原文，下方一个大按钮按住说
 function holdPanel(o){
@@ -816,6 +932,10 @@ async function readAloud(target, ctx, ctxLabel){
   TTS.stop();
   const blind = (S.settings.readMode || "look") === "blind";
   const mode = sttMode();
+  if (AIREC.ok()) {
+    if (blind && target) await TTS.speak(target);
+    return aiPanel({ target, ctx, ctxLabel, hide: blind && !!target });
+  }
   if (STT.ok()) {
     if (blind && target) await TTS.speak(target);
     return holdPanel({ target, ctx, ctxLabel, hide: blind && !!target, autoSend: true });
@@ -1495,11 +1615,11 @@ VIEWS.lesson = async (v, p) => {
     $$("[data-sh]", v).forEach(b => b.onclick = async () => {
       const i = +b.dataset.sh;
       const said = await readAloud(L.shadow[i]); if (!said) return;
-      const r = shadowScore(L.shadow[i], said);
+      const r = judge(L.shadow[i], said);
       st.best[i] = Math.max(st.best[i] || 0, r.score); st.miss = st.miss || {}; st.miss[i] = r.missed; save();
       const el = $("#sc" + i, v); el.textContent = r.score + "%"; el.className = "score " + scoreClass(r.score);
       markMissed($$(".shadow", v)[i], r.missed);
-      pop(`<div class="title ${scoreClass(r.score)}">${r.score >= 85 ? "🌟" : r.score >= 65 ? "👍" : "💪"} ${r.score}%</div><div class="muted small" style="margin-top:6px">识别到：${esc(said)}</div>${r.missed.length ? `<div style="margin-top:6px">没对上：<b>${esc(r.missed.join(", "))}</b></div><div class="muted small">已在句子里用底纹标出，点那个词可以单独听</div>` : `<div style="margin-top:6px">全部对上 👍</div>`}`);
+      pop(`<div class="title ${scoreClass(r.score)}">${r.score >= 85 ? "🌟" : r.score >= 65 ? "👍" : "💪"} ${r.score}%</div><div class="muted small" style="margin-top:6px">${r.ai ? "AI 听到" : "识别到"}：${esc(said)}</div>${r.missed.length ? `<div style="margin-top:6px">没对上：<b>${esc(r.missed.join(", "))}</b></div><div class="muted small">已在句子里用底纹标出，点那个词可以单独听</div>` : `<div style="margin-top:6px">全部对上 👍</div>`}${hearHtml(r)}`);
     });
     const nx = $("#next", v); if (nx) nx.onclick = () => { TTS.stop(); st.done[st.step] = true; st.step++; draw(); };
     const m = $("#map", v); if (m) m.onclick = () => back();
@@ -1560,7 +1680,7 @@ function Chat(box, o){
         const said = await readAloud(t);          // 必须自己读出来
         if (!said) return;                         // 取消就留在原处，可以换一句或自己说
         sg.remove();
-        send(said, { target: t, score: shadowScore(t, said) });
+        send(said, { target: t, score: judge(t, said) });
       });
       scroll();
     }
@@ -1579,7 +1699,7 @@ function Chat(box, o){
     const s = $("[data-a=say]", f); if (s) s.onclick = () => TTS.speak(fb.better_version, { slow: true });
     const r = $("[data-a=re]", f); if (r) r.onclick = async () => {
       const t = await readAloud(fb.better_version); if (!t) return; retries++;
-      const sc = shadowScore(fb.better_version, t);
+      const sc = judge(fb.better_version, t);
       $("[data-a=res]", f).innerHTML = `<span class="${scoreClass(sc.score)}"><b>${sc.score}%</b></span> · 识别到：${esc(t)}${sc.missed.length ? `<br>没对上：<b>${esc(sc.missed.join(", "))}</b>` : " 👍"}`;
     };
     scroll();
@@ -1606,7 +1726,26 @@ function Chat(box, o){
       $("button", d).onclick = () => { d.remove(); msgs.lastElementChild && msgs.lastElementChild.classList.contains("me") && msgs.lastElementChild.remove(); waiting = false; send(text); };
     } finally { waiting = false; $("#mic", box).disabled = false; }
   }
-  if (STT.ok()) {
+  if (AIREC.ok()) {
+    let liveB = null;
+    recToTalk($("#mic", box), {
+      idle: "🎤 按住说话（松开发送）",
+      onDone: async r => {
+        if (r.err) { toast(RECERR[r.err] || ("录音出错：" + r.err), 3000); return; }
+        liveB = add("me live", `<div class="bub"><span class="muted">🤖 正在听…</span></div>`); scroll();
+        const mic = $("#mic", box); mic.disabled = true;
+        try {
+          const h = await rpc("hear", { b64: await blobB64(r.blob), mime: r.blob.type, target: null });
+          liveB.remove(); liveB = null;
+          const t = (h.heard || "").trim();
+          if (!t) { toast("AI 没听清，再说一次", 2500); return; }
+          if (/[\u4e00-\u9fff]/.test(t)) { toast("听到的是中文，请用英文再说一次", 2500); return; }
+          send(t);
+        } catch (e) { if (liveB) { liveB.remove(); liveB = null; } toast(e.message || "AI 没回应，再试一次", 3500); }
+        finally { mic.disabled = false; }
+      },
+    });
+  } else if (STT.ok()) {
     let liveB = null;
     holdToTalk($("#mic", box), {
       idle: "🎤 按住说话（松开发送）",
@@ -1632,7 +1771,7 @@ function Chat(box, o){
       const st = await rpc("hint", { scene: o.scene, partner: lastPartner() });
       d.innerHTML = `<div class="card" style="text-align:left;margin:0"><div class="muted small" style="margin-bottom:6px">💡 可以这样回答（点句子 → 先听 → 看着读出来）</div>${st.map(x => `<div class="shadow"><button class="ib" data-s>🔊</button><div class="grow" data-send><div class="en" style="font-size:16px">${esc(x.en)}</div><div class="zh">${esc(x.zh)}</div></div></div>`).join("")}<div class="muted small">也可以只看一眼，然后用 🎤 换成自己的话说</div></div>`;
       $$("[data-s]", d).forEach((b, i) => b.onclick = () => TTS.speak(st[i].en));
-      $$("[data-send]", d).forEach((b, i) => b.onclick = async () => { const t = st[i].en; await TTS.speak(t); const said = await readAloud(t); if (!said) return; d.remove(); send(said, { target: t, score: shadowScore(t, said) }); });
+      $$("[data-send]", d).forEach((b, i) => b.onclick = async () => { const t = st[i].en; await TTS.speak(t); const said = await readAloud(t); if (!said) return; d.remove(); send(said, { target: t, score: judge(t, said) }); });
       scroll();
     } catch (e) { d.innerHTML = `<div class="bub">提示没拿到：${esc(e.message)}</div>`; }
   };
@@ -1729,10 +1868,10 @@ VIEWS.newsLesson = async (v, p) => {
     $$(".shadow", v).forEach((row, i) => markMissed(row, (st.miss || {})[i]));
     $$("[data-sh]", v).forEach(b => b.onclick = async () => {
       const i = +b.dataset.sh; const said = await readAloud(L.shadow[i]); if (!said) return;
-      const r = shadowScore(L.shadow[i], said); st.best[i] = Math.max(st.best[i] || 0, r.score); st.miss = st.miss || {}; st.miss[i] = r.missed; save();
+      const r = judge(L.shadow[i], said); st.best[i] = Math.max(st.best[i] || 0, r.score); st.miss = st.miss || {}; st.miss[i] = r.missed; save();
       const el = $("#sc" + i, v); el.textContent = r.score + "%"; el.className = "score " + scoreClass(r.score);
       markMissed($$(".shadow", v)[i], r.missed);
-      pop(`<div class="title ${scoreClass(r.score)}">${r.score}%</div><div class="muted small" style="margin-top:6px">识别到：${esc(said)}</div>${r.missed.length ? `<div style="margin-top:6px">没对上：<b>${esc(r.missed.join(", "))}</b></div><div class="muted small">已在句子里用底纹标出，点那个词可以单独听</div>` : `<div style="margin-top:6px">全部对上 👍</div>`}`);
+      pop(`<div class="title ${scoreClass(r.score)}">${r.score}%</div><div class="muted small" style="margin-top:6px">${r.ai ? "AI 听到" : "识别到"}：${esc(said)}</div>${r.missed.length ? `<div style="margin-top:6px">没对上：<b>${esc(r.missed.join(", "))}</b></div><div class="muted small">已在句子里用底纹标出，点那个词可以单独听</div>` : `<div style="margin-top:6px">全部对上 👍</div>`}${hearHtml(r)}`);
     });
     const check = async (k, ans) => {
       if (!ans) return; const [gi, qi] = k.split("-").map(Number); const g = L.grammar[gi], q = g.practice[qi];
@@ -1893,7 +2032,7 @@ VIEWS.review = async (v, p) => {
       try { c.why = await rpc("explain", { id: c.id, term: c.term, ex: c.ex }); $("#whybox", v).innerHTML = whyHtml(c) || `<div class="muted small">没有特别的来历</div>`; }
       catch (e) { b.disabled = false; b.textContent = "💡 为什么这么说？（重试）"; toast("没查到：" + e.message); }
     };
-    $("#sh", v).onclick = async () => { const tx = sentenceOf(c.ex || c.term, c.term); const t = await readAloud(tx); if (!t) return; const r = shadowScore(tx, t); $("#shres", v).innerHTML = `<b class="${scoreClass(r.score)}">${r.score}%</b> · ${esc(t)}${r.missed.length ? `<br>没对上：${esc(r.missed.join(", "))}` : ""}`; };
+    $("#sh", v).onclick = async () => { const tx = sentenceOf(c.ex || c.term, c.term); const t = await readAloud(tx); if (!t) return; const r = judge(tx, t); $("#shres", v).innerHTML = `<b class="${scoreClass(r.score)}">${r.score}%</b> · ${esc(t)}${r.missed.length ? `<br>没对上：${esc(r.missed.join(", "))}` : ""}${hearHtml(r)}`; };
     bindGrade(c);
   };
   const bindDel = c => { const b = $("#delc", v); if (b) b.onclick = async () => {
@@ -1938,7 +2077,7 @@ VIEWS.settings = async (v, p) => {
   h += `<h2>国家 / 地区</h2><div class="card"><div class="row" style="flex-wrap:wrap;gap:8px">${(S.regions || []).map(r => `<button class="chip ${r.key === (st.region || "NZ") ? "on" : ""}" data-reg="${r.key}">${r.flag} ${r.zh}</button>`).join("")}</div><div class="muted small" style="margin-top:10px">影响课程和对话的口音、拼写和当地说法。每个地区的课程进度分开保存，切回来进度还在；单词本共用。</div></div>`;
   h += `<h2>学习起点和每日目标</h2><div class="card"><div class="seg" id="slv"><button data-s="1">🌱 入门</button><button data-s="2">🌿 进阶</button></div><div class="row" style="margin-top:12px;flex-wrap:wrap;gap:8px">${[30, 50, 80].map(g => `<button class="chip ${g === (st.dailyGoal || 50) ? "on" : ""}" data-goal="${g}">每天 ${g} 经验</button>`).join("")}</div></div>`;
   if (window.__WEB) {
-    h += `<h2>说话输入方式</h2><div class="card"><div class="seg" id="sttw"><button data-x="hold">🎤 按住说</button><button data-x="keyboard">⌨️ 键盘听写</button></div><div class="muted small" style="margin-top:10px"><b>按住说</b>：按住大按钮说话，松开结束（或点一下开始、再点一下结束），原文一直看得见。第一次会问能不能用麦克风，选「允许」。<br><b>键盘听写</b>：用 iPhone 键盘上的 🎤，键盘要先切到 English。</div></div>`;
+    h += `<h2>说话输入方式</h2><div class="card"><div class="seg" id="sttw"><button data-x="ai">🎤 录音 + AI 听</button><button data-x="keyboard">⌨️ 键盘听写</button></div><div class="muted small" style="margin-top:10px"><b>录音 + AI 听</b>（推荐）：按住说话，松开后录音交给 Gemini。跟读时它会指出哪个词读得不对、怎么改，还能回放自己的录音；对话时它把你的话转成文字（保留你原来的说法，好让 AI 纠错）。每次要等几秒。第一次会问麦克风权限，选「允许」。<br><b>键盘听写</b>：用 iPhone 键盘上的 🎤，键盘要先切到 English。不花 AI 额度，但只认字，不判发音。</div></div>`;
     h += `<h2>跟读方式</h2><div class="card"><div class="seg" id="rmode"><button data-r="look">🟢 初级：看着读</button><button data-r="blind">🔴 高级：听后复述</button></div><div class="muted small" style="margin-top:10px">初级：原文显示在上方，看着读。高级：先播放一遍，原文藏起来，凭记忆说。</div></div>`;
   } else {
     h += `<h2>说话输入方式</h2><div class="card"><div class="seg" id="sttm"><button data-x="auto">✅ 推荐</button><button data-x="keyboard">⌨️ 全用键盘</button><button data-x="native">🎙 全用听写面板</button><button data-x="hold">按住说（不稳定）</button></div><div class="muted small" style="margin-top:10px"><b>推荐</b>：跟读（看着读）用键盘听写，原文一直看得见；对话和语法用苹果听写面板，点一下就录、最稳定，但会盖住屏幕，说完点「完成」。<br>键盘听写需要先在 设置›通用›键盘 里加一个 English 键盘，说话前用 🌐 切过去，不然会出中文。<br>「按住说」是网页识别，实测每次打开只能稳定用一次，只留作备用。</div></div>`;
@@ -2041,7 +2180,7 @@ window.__APP = async function (FileManager, Keychain, Request, Dictation, Speech
 // ============================================================
 
 const IS_WEB = typeof __WEB__ !== "undefined";
-const VERSION = IS_WEB ? "5.0" : "4.6";
+const VERSION = IS_WEB ? "5.1" : "4.6";
 const CFG = {
   dirName: "english",
   locales: ["en-US", "en-AU", "en-GB"],
@@ -2521,6 +2660,37 @@ const S = {
   arr: items => ({ type: "ARRAY", items }),
   obj: (props, req) => ({ type: "OBJECT", properties: props, required: req || Object.keys(props) }),
 };
+
+// ---------------- AI 听录音（5.1）：跟读判发音；自由说话只转文字 ----------------
+async function hear({ b64, mime, target }) {
+  if (!b64) throw new Error("没有录到声音");
+  const audio = { inlineData: { mimeType: String(mime || "audio/mp4").split(";")[0], data: b64 } };
+  if (!target) {
+    const out = await gemini(
+      "You transcribe short voice messages from a Chinese adult learning English. Write exactly the English words he said, keeping his grammar mistakes and word choices (do NOT correct or improve them). Add normal punctuation. If the audio is silent or unintelligible, return heard as an empty string. If he spoke Chinese, write the Chinese as heard.",
+      null, S.obj({ heard: S.str }), 0,
+      [{ role: "user", parts: [audio, { text: "Transcribe this." }] }], { lite: true });
+    return { heard: String(out.heard || "").trim() };
+  }
+  const out = await gemini(
+    `You are a strict but kind English pronunciation coach for a Chinese adult learner who lives in ${region().name}. He is reading this target sentence aloud:
+"${target}"
+Listen to the audio carefully and judge what you actually hear, not what he meant.
+- heard: write word by word what he actually said, as you heard it. Keep wrong, missing and extra words. Do NOT auto-correct it to the target sentence.
+- issues: at most 4, the most important problems first. Each is tied to ONE word of the target sentence: word = that word exactly as written in the target; heard_as = how it sounded (e.g. "tree" for "three", "wor" for "work", or "missing" if he skipped it); tip_zh = a concrete fix in simplified Chinese, max 30 characters (mouth, tongue, ending sound, stress or linking).
+  Count: missing or extra words, dropped ending sounds (-s, -ed, -t, -d), wrong vowels (ship/sheep), th, v/w, l/r, wrong word stress. Do NOT count a normal Chinese accent if a local would understand the word easily.
+- score 0-100: 90+ clear and natural; 75-89 easy to understand with small slips; 60-74 understandable but several problems; below 60 hard to understand or several words missing. Silent or unrelated audio: score 0, heard "".
+- overall_zh: one short sentence in simplified Chinese (max 25 characters): what to focus on next time, or praise if it was good.`,
+    null,
+    S.obj({ heard: S.str, score: S.int, issues: S.arr(S.obj({ word: S.str, heard_as: S.str, tip_zh: S.str })), overall_zh: S.str }), 0.2,
+    [{ role: "user", parts: [audio, { text: "Judge my reading of the target sentence." }] }]);
+  return {
+    heard: String(out.heard || "").trim(),
+    score: Math.max(0, Math.min(100, Math.round(+out.score || 0))),
+    issues: (out.issues || []).filter(x => x && x.word).slice(0, 4),
+    overall_zh: String(out.overall_zh || ""),
+  };
+}
 
 // ---------------- 课程 ----------------
 const TRACKS = [
@@ -3158,6 +3328,7 @@ const RPC = {
   grade: ({ id, q }) => grade(id, q),
   addCards: ({ items, cat }) => addCards(items, cat),
   listen: () => listen(),
+  hear: (p) => hear(p),
   speak: async ({ text }) => { try { await Speech.speak(text); } catch (e) {} return true; },
   openUrl: ({ url }) => { Safari.open(url); return true; },
 
