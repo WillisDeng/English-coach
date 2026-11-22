@@ -789,19 +789,32 @@ function holdToTalk(btn, { onText, onDone, idle }){
 }
 // ---- 5.1：真录音 + AI 听（不用苹果听写：没有"只能录一次"，也没有提示音） ----
 // 麦克风打开一次后保持，按下就开始录；离开 60 秒或 App 切到后台就关掉麦克风
-const AIREC = {
+const AIREC = window.AIREC = {
   stream: null, ctx: null, an: null, idleT: 0,
   supported(){ return !!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia); },
   ok(){ return sttMode() === "ai"; },
   async mic(){
     clearTimeout(this.idleT);
-    if (this.stream && this.stream.active && this.stream.getAudioTracks().some(t => t.readyState === "live")) return this.stream;
+    // iPhone 播放过朗读、来过电话或切过后台后，麦克风可能被系统"静音"但看起来还开着：这种情况重新打开
+    if (this.stream && this.stream.active && !this.stale && this.stream.getAudioTracks().some(t => t.readyState === "live" && !t.muted && t.enabled)) return this.stream;
+    this.release(); this.stale = false;
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     try { this.ctx = this.ctx || new (window.AudioContext || window.webkitAudioContext)(); this.an = this.ctx.createAnalyser(); this.an.fftSize = 1024; this.ctx.createMediaStreamSource(this.stream).connect(this.an); } catch (e) { this.an = null; }
     return this.stream;
   },
   idle(){ clearTimeout(this.idleT); this.idleT = setTimeout(() => this.release(), 60000); },
   release(){ clearTimeout(this.idleT); if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; } },
+  stale: false,
+  // 真正检查录音里有没有声音：把录音解码出来看音量（不依赖实时音量条，iPhone 上音量条可能读不到）
+  async peakOf(blob){
+    try {
+      const C = window.AudioContext || window.webkitAudioContext; if (!C) return -1;
+      const c = this.ctx || (this.ctx = new C());
+      const buf = await new Promise((res, rej) => { blob.arrayBuffer().then(ab => { const pr = c.decodeAudioData(ab, res, rej); if (pr && pr.then) pr.then(res, rej); }, rej); });
+      let pk = 0; for (let ch = 0; ch < buf.numberOfChannels; ch++) { const d = buf.getChannelData(ch); for (let i = 0; i < d.length; i += 4) { const v = Math.abs(d[i]); if (v > pk) pk = v; } }
+      return pk;
+    } catch (e) { return -1; }   // 解不了就不判断，照样交给 AI
+  },
   level(){ if (!this.an) return 0; const d = new Uint8Array(this.an.fftSize); this.an.getByteTimeDomainData(d); let pk = 0; for (const x of d) pk = Math.max(pk, Math.abs(x - 128) / 128); return pk; },
 };
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") AIREC.release(); });
@@ -821,11 +834,13 @@ function recToTalk(btn, { idle, onDone, onLevel }){
     const type = MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : (MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "");
     mr = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
     mr.ondataavailable = ev => { if (ev.data && ev.data.size) chunks.push(ev.data); };
-    mr.onstop = () => {
+    mr.onstop = async () => {
       const secs = (Date.now() - t0) / 1000, blob = new Blob(chunks, { type: (mr && mr.mimeType) || type || "audio/mp4" });
-      mr = null; busy = false; stopUI(); AIREC.idle();
-      if (secs < 0.6 || blob.size < 1500) { onDone({ err: "short" }); return; }
-      if (AIREC.an && peak < 0.02) { onDone({ err: "silent" }); return; }
+      mr = null; stopUI(); AIREC.idle();
+      if (secs < 0.6 || blob.size < 1500) { busy = false; onDone({ err: "short" }); return; }
+      const pk = await AIREC.peakOf(blob); busy = false;
+      // 录音本身是静音（不是你声音小，是麦克风被系统暂停了）：下次按下时重新打开麦克风
+      if (pk >= 0 && pk < 0.004) { AIREC.stale = true; onDone({ err: "silent", diag: `peak ${pk.toFixed(4)} · meter ${peak.toFixed(3)}` }); return; }
       onDone({ blob, secs });
     };
     mr.start(250); loop();
@@ -839,7 +854,7 @@ function recToTalk(btn, { idle, onDone, onLevel }){
   btn.addEventListener("mousedown", press); btn.addEventListener("mouseup", release);
   label(idle);
 }
-const RECERR = { "not-allowed": "麦克风没被允许：请在弹窗里选「允许」；以前拒绝过的话，到 iPhone 设置 › Safari › 麦克风 改成允许", short: "太短了：按住说完整句再松开", silent: "没录到声音：靠近一点再说" };
+const RECERR = { "not-allowed": "麦克风没被允许：请在弹窗里选「允许」；以前拒绝过的话，到 iPhone 设置 › Safari › 麦克风 改成允许", short: "太短了：按住说完整句再松开", silent: "这次录音是静音（麦克风被 iPhone 暂停了，常见于刚播放过声音）。已重新打开麦克风，请再按住说一次" };
 let LAST_HEAR = null;   // 最近一次 AI 听的结果（跟读打分用）
 // 看着读 / 回答：上方原文，下方按住录音；松开后交给 AI 听
 function aiPanel(o){
@@ -875,7 +890,7 @@ function aiPanel(o){
     recToTalk(mic, {
       idle: "🎤 按住说话（或点一下开始）",
       onLevel: l => { lvl.style.width = Math.min(100, l * 260) + "%"; },
-      onDone: r => { if (r.err) { live.innerHTML = `<span class="muted small">${esc(RECERR[r.err] || ("录音出错：" + r.err))}</span>`; return; } ask(r.blob, r.blob.type); },
+      onDone: r => { if (r.err) { live.innerHTML = `<span class="muted small">${esc(RECERR[r.err] || ("录音出错：" + r.err))}</span>${r.diag ? `<div class="muted" style="font-size:10px;opacity:.6;margin-top:4px">${esc(r.diag)}</div>` : ""}`; return; } ask(r.blob, r.blob.type); },
     });
   });
 }
@@ -896,7 +911,7 @@ function hearHtml(r){
 let MYREC_AUDIO = null;
 document.addEventListener("click", e => {
   const a = e.target.closest && e.target.closest("[data-myrec]");
-  if (a && LAST_HEAR && LAST_HEAR.url) { TTS.stop(); try { if (MYREC_AUDIO) MYREC_AUDIO.pause(); MYREC_AUDIO = new Audio(LAST_HEAR.url); MYREC_AUDIO.play(); } catch (err) {} return; }
+  if (a && LAST_HEAR && LAST_HEAR.url) { TTS.stop(); try { if (MYREC_AUDIO) MYREC_AUDIO.pause(); MYREC_AUDIO = new Audio(LAST_HEAR.url); MYREC_AUDIO.play(); AIREC.stale = true; } catch (err) {} return; }
   const b = e.target.closest && e.target.closest("[data-orig]");
   if (b && b.dataset.orig) TTS.speak(b.dataset.orig);
 });
@@ -1038,6 +1053,7 @@ const TTS = {
   // 短句：不指定具体声音，只设语言 → iOS 会用你在「阅读与朗读 › 声音」里为这个英文口音选的声音
   speak(text, opt){
     opt = opt || {}; text = String(text || "").replace(/["“”]/g, ""); if (!text.trim()) return Promise.resolve();
+    if (window.AIREC) AIREC.stale = true;   // 播放过声音，下次录音前重新打开麦克风（iPhone 可能把它暂停了）
     if (S.settings.tts === "system" || typeof speechSynthesis === "undefined") return this.native(text);
     AI.stop();
     const me = ++this._cur;              // 这一句的编号；被更新的朗读顶掉后就不再处理
